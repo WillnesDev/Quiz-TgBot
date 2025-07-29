@@ -12,9 +12,11 @@ import glob
 # PDF va DOCX uchun kutubxonalar
 import docx
 import PyPDF2
+import time
+import json
 
 # ================= Bot token ===================
-BOT_TOKEN = "7637437071:AAFiNVYnPqykWpWtrf9XsBKc9gHNEvejt58"
+BOT_TOKEN = "8053534225:AAGfzWhFc9ZJaMwxL9RM3tVZVae_hdPnCHM"
 ADMIN_IDS = [5106477690, 7095273576]  # << ADMIN Telegram ID larini shu yerga yozing
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -209,7 +211,7 @@ def clear_verification_code(user_id):
     except FileNotFoundError:
         pass
 
-
+# test_time_limits.json va unga oid kodlar olib tashlandi.
 
 # ================== /start ============================
 @bot.message_handler(commands=['start'])
@@ -239,9 +241,15 @@ def start_command(message):
 
 def ask_phone(message):
     user_id = message.from_user.id
+    # Ism kiritishda / bilan boshlansa, xatolik va qayta so'rash
+    if message.text.strip().startswith('/'):
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(types.KeyboardButton("/stop"))
+        bot.send_message(message.chat.id, "❌ Xato bo‘ldi, iltimos ismingizni kiriting:", reply_markup=markup)
+        bot.register_next_step_handler(message, ask_phone)
+        return
     session = get_user_session(user_id)
     session.full_name = message.text
-
     # /stop tugmasi bilan telefon raqami so'rash
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     button = types.KeyboardButton(text="📞 Telefon raqamni yuborish", request_contact=True)
@@ -274,113 +282,156 @@ Testni boshlash uchun /quiz buyrug'ini yuboring."""
     bot.send_message(message.chat.id, welcome, parse_mode='Markdown')
 
 # ================== /quiz ============================
+@bot.message_handler(commands=['new'])
+def new_test_command(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "Faqat admin yangi test yuklashi mumkin!")
+        return
+    bot.send_message(message.chat.id, "Yangi test faylini (Excel, .xlsx) yuboring.")
+    bot.register_next_step_handler(message, handle_new_test_file)
+
+def handle_new_test_file(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "Faqat admin yangi test yuklashi mumkin!")
+        return
+    if not message.document:
+        bot.send_message(message.chat.id, "Fayl yuborilmadi. Iltimos, .xlsx fayl yuboring.")
+        return
+    file_info = bot.get_file(message.document.file_id)
+    file_name = message.document.file_name
+    downloaded_file = bot.download_file(file_info.file_path)
+    with open(file_name, "wb") as f:
+        f.write(downloaded_file)
+    questions = load_questions_from_excel(file_name)
+    num_questions = len(questions)
+    bot.send_message(message.chat.id, f"✅ Yangi test fayli yuklandi! ({file_name})\nSavollar soni: {num_questions}")
+
 @bot.message_handler(commands=['quiz'])
 def start_quiz(message):
     user_id = message.from_user.id
-    session = get_user_session(user_id)
-
-    # Verifikatsiya tekshirish
-    if session.verification_step != "completed":
-        bot.send_message(message.chat.id, 
-            "❌ Avval telefon raqamingizni tasdiqlashingiz kerak!\n"
-            "/start buyrug'i bilan qaytadan boshlang.")
-        return
-
-    # Mavjud .xlsx fayllarni topish
     test_files = [f for f in glob.glob("*.xlsx") if not f.startswith("~$")]
     if not test_files:
         bot.send_message(message.chat.id, "Hech qanday test fayli topilmadi.")
         return
-
-    # Fayl nomidan test nomini chiqarish
     test_names = [f.replace(".xlsx", "") for f in test_files]
     markup = types.InlineKeyboardMarkup(row_width=2)
     for name in test_names:
         markup.add(types.InlineKeyboardButton(name.title(), callback_data=f"select_test_{name}"))
     bot.send_message(message.chat.id, "Qaysi testni tanlaysiz?", reply_markup=markup)
 
-# handle_select_test va show_results funksiyalarida test nomini save_result ga uzatish
 @bot.callback_query_handler(func=lambda call: call.data.startswith('select_test_'))
 def handle_select_test(call):
     user_id = call.from_user.id
-    session = get_user_session(user_id)
     test_name = call.data.replace('select_test_', '')
     file_name = f"{test_name}.xlsx"
-    try:
-        session.questions = load_questions_from_excel(file_name)
-        if not session.questions:
-            bot.send_message(call.message.chat.id, f"❌ Bu test faylida savollar topilmadi: {file_name}")
-            return
-        session.score = 0
-        session.current_question = 0
-        session.is_active = True
-        session.wrong_answers = []
-        session.test_name = test_name  # test nomini sessionga saqlaymiz
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        send_question(call.message.chat.id, user_id)
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"Xatolik: {e}\nFayl: {file_name}")
+    questions = load_questions_from_excel(file_name)
+    random.shuffle(questions)
+    user_data[user_id] = {
+        'questions': questions,
+        'score': 0,
+        'current_question': 0,
+        'wrong_answers': [],
+        'time_limit': get_test_time_limit(len(questions))
+    }
+    time_limit = user_data[user_id]['time_limit']
+    if time_limit:
+        def time_up():
+            bot.send_message(call.message.chat.id, "⏰ Vaqt tugadi! Natijangiz quyidagicha:")
+            show_results_simple(call.message.chat.id, user_data[user_id])
+            user_data.pop(user_id, None)
+        Timer(time_limit, time_up).start()
+        bot.send_message(call.message.chat.id, f"⏳ Sizga {time_limit//60} minut {time_limit%60} sekund vaqt berildi. Test boshlandi!")
+    bot.edit_message_text("Test boshlandi!", call.message.chat.id, call.message.message_id)
+    send_question_simple(call.message.chat.id, user_data[user_id])
 
+def get_test_time_limit(num_questions):
+    if num_questions == 5:
+        return 60
+    elif num_questions == 10:
+        return 120
+    elif num_questions == 15:
+        return 240
+    elif num_questions == 30:
+        return 300
+    else:
+        return None  # Cheklov yo'q yoki default
 
-def send_question(chat_id, user_id):
-    session = get_user_session(user_id)
-    q_num = session.current_question
-
-    if q_num >= len(session.questions):
-        show_results(chat_id, user_id)
+def send_question_simple(chat_id, data):
+    q_num = data['current_question']
+    if q_num >= len(data['questions']):
+        show_results_simple(chat_id, data)
         return
-
-    question_data = session.questions[q_num]
+    question_data = data['questions'][q_num]
     markup = types.InlineKeyboardMarkup(row_width=1)
-
+    text = f"*Savol {q_num + 1}/{len(data['questions'])}*\n\n{question_data['question']}\n\n"
     for i, option in enumerate(question_data["options"]):
-        callback_data = f"answer_{user_id}_{i}"
+        callback_data = f"answer_simple_{i}"
         markup.add(types.InlineKeyboardButton(option, callback_data=callback_data))
-    # /stop tugmasini har bir savolda qo'shamiz
-    markup.add(types.InlineKeyboardButton("/stop", callback_data=f"stop_{user_id}"))
-
-    text = (
-        f"*Savol {q_num + 1}/{len(session.questions)}*\n\n"
-        f"{question_data['question']}\n\n"
-        "Javobni tanlang:"
-    )
+    text += "Javobni tanlang:"
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('answer_'))
-def handle_answer(call):
-    try:
-        _, user_id, selected = call.data.split('_')
-        user_id = int(user_id)
-        selected = int(selected)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('answer_simple_'))
+def handle_answer_simple(call):
+    user_id = call.from_user.id
+    data = user_data.get(user_id)
+    if not data:
+        bot.answer_callback_query(call.id, "Xatolik!")
+        return
+    i = int(call.data.replace('answer_simple_', ''))
+    question_data = data['questions'][data['current_question']]
+    letter_to_index = {"A": 0, "B": 1, "C": 2, "D": 3}
+    correct = question_data["correct"]
+    correct_index = letter_to_index.get(str(correct).strip().upper(), 0)
+    is_correct = (i == correct_index)
+    user_answer = question_data["options"][i]
+    correct_answer = question_data["options"][correct_index]
+    if is_correct:
+        data['score'] += 1
+    else:
+        data['wrong_answers'].append({
+            "savol": question_data["question"],
+            "sizning_javobingiz": user_answer,
+            "togri_javob": correct_answer
+        })
+    data['current_question'] += 1
+    bot.answer_callback_query(call.id)
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    send_question_simple(call.message.chat.id, data)
 
-        if call.from_user.id != user_id:
-            bot.answer_callback_query(call.id, "Bu sizning savolingiz emas!")
-            return
+def show_results_simple(chat_id, data):
+    score = data['score']
+    total = len(data['questions'])
+    percent = (score / total) * 100
+    if percent >= 80:
+        grade = "A'lo 🏆"
+    elif percent >= 60:
+        grade = "Yaxshi 👍"
+    elif percent >= 40:
+        grade = "Qoniqarli 👌"
+    else:
+        grade = "Qoniqarsiz 📚"
+    text = f"""✅ *Test yakunlandi!*
+\n📊 *Natija:* {score}/{total}\n📈 *Foiz:* {percent:.1f}%\n🎓 *Baho:* {grade}\n"""
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+    if data['wrong_answers']:
+        wrongs = "\n\n❌ *Xato javoblaringiz:*\n"
+        for i, item in enumerate(data['wrong_answers'], 1):
+            explanation = ""
+            for q in data['questions']:
+                if q["question"] == item["savol"]:
+                    explanation = q.get("explanation", "")
+                    break
+            wrongs += f"\n{i}. {item['savol']}\nSiz: {item['sizning_javobingiz']}\nTo'g'ri: {item['togri_javob']}\n"
+            if explanation:
+                wrongs += f"Tushuntirish: {explanation}\n"
+        bot.send_message(chat_id, wrongs, parse_mode='Markdown')
+    # Test tugaganda sessionni tozalash
+    for k in list(user_data.keys()):
+        if user_data[k] is data:
+            del user_data[k]
+            break
 
-        session = get_user_session(user_id)
-
-        if not session.is_active:
-            bot.answer_callback_query(call.id, "Test allaqachon tugagan.")
-            return
-
-        question_data = session.questions[session.current_question]
-        if selected == question_data["correct"]:
-            session.score += 1
-        else:
-            session.wrong_answers.append({
-                "savol": question_data["question"],
-                "sizning_javobingiz": question_data["options"][selected],
-                "togri_javob": question_data["options"][question_data["correct"]]
-            })
-
-        session.current_question += 1
-        bot.answer_callback_query(call.id)
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        send_question(call.message.chat.id, user_id)
-
-    except Exception as e:
-        print(f"Xatolik: {e}")
-        bot.answer_callback_query(call.id, "Xatolik yuz berdi!")
+# Eski handle_answer funksiyasi va handleri olib tashlandi, faqat answer_simple_ uchun handler qoldi.
 
 # Test paytida /stop tugmasi bosilsa, session tozalanadi
 def handle_stop_during_quiz(call):
@@ -399,14 +450,15 @@ bot.callback_query_handler(func=lambda call: call.data.startswith('stop_'))(hand
 def show_results(chat_id, user_id):
     session = get_user_session(user_id)
     session.is_active = False
-
+    if session.timer:
+        session.timer.cancel()
+        session.timer = None
     score = session.score
     total = len(session.questions)
     if total == 0:
         bot.send_message(chat_id, "❌ Test savollari topilmadi yoki yuklanmadi.")
         return
     percent = (score / total) * 100
-
     if percent >= 80:
         grade = "A'lo 🏆"
     elif percent >= 60:
@@ -415,20 +467,29 @@ def show_results(chat_id, user_id):
         grade = "Qoniqarli 👌"
     else:
         grade = "Qoniqarsiz 📚"
-
-    # test nomini sessiondan olamiz, yo'q bo'lsa 'default'
     test_name = getattr(session, 'test_name', 'default')
+    # Test qancha vaqtda bajarilganini hisoblash
+    vaqt = "-"
+    if hasattr(session, 'test_start_time'):
+        seconds = int(time.time() - session.test_start_time)
+        if seconds < 60:
+            vaqt = f"{seconds} sekund"
+        else:
+            vaqt = f"{seconds//60} minut {seconds%60} sekund"
     save_result(user_id, session.full_name, session.phone_number, score, test_name)
-
     text = f"""✅ *Test yakunlandi!*
 
 👤 *Ism:* {session.full_name}
 📞 *Tel:* {session.phone_number}
 📊 *Natija:* {score}/{total}
 📈 *Foiz:* {percent:.1f}%
-🎓 *Baho:* {grade}\n\n_Bu bot @Yunusbek0 tomonidan yaratilgan_"""
-    bot.send_message(chat_id, text, parse_mode='Markdown')
+⏱ *Siz bu testni {vaqt} ichida bajardingiz.*
+🎓 *Baho:* {grade}
 
+➡️ Yana test ishlamoqchi bo‘lsangiz /quiz ni bosing.
+
+_Bu bot @Yunusbek0 tomonidan yaratilgan_"""
+    bot.send_message(chat_id, text, parse_mode='Markdown')
     if session.wrong_answers:
         wrongs = "\n\n❌ *Xato javoblaringiz:*\n"
         for i, item in enumerate(session.wrong_answers, 1):
@@ -453,31 +514,6 @@ def admin_panel(message):
         )
     else:
         bot.send_message(message.chat.id, "Siz admin emassiz!")
-
-@bot.message_handler(commands=['new'])
-def new_test_command(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.send_message(message.chat.id, "Faqat admin yangi test yuklashi mumkin!")
-        return
-    bot.send_message(message.chat.id, "Yangi test faylini (Excel, .xlsx) yuboring.")
-    bot.register_next_step_handler(message, handle_new_test_file)
-
-def handle_new_test_file(message):
-    if message.from_user.id not in ADMIN_IDS:
-        bot.send_message(message.chat.id, "Faqat admin yangi test yuklashi mumkin!")
-        return
-    if not message.document:
-        bot.send_message(message.chat.id, "Fayl yuborilmadi. Iltimos, .xlsx fayl yuboring.")
-        return
-    file_info = bot.get_file(message.document.file_id)
-    file_name = message.document.file_name
-    downloaded_file = bot.download_file(file_info.file_path)
-    with open(file_name, "wb") as f:
-        f.write(downloaded_file)
-    # Savollarni yangilash
-    global QUESTIONS
-    QUESTIONS = load_questions_from_excel(file_name)
-    bot.send_message(message.chat.id, f"✅ Yangi test fayli yuklandi va savollar yangilandi! ({file_name})")
 
 @bot.message_handler(commands=['deletetest'])
 def delete_test_command(message):
@@ -576,6 +612,10 @@ def restart_command(message):
 def stop_command(message):
     user_id = message.from_user.id
     if user_id in user_data:
+        session = user_data[user_id]
+        if session.timer:
+            session.timer.cancel()
+            session.timer = None
         del user_data[user_id]
     bot.send_message(message.chat.id, "❌ Jarayon to'xtatildi. /start orqali qayta boshlang.")
 
@@ -586,4 +626,5 @@ def main():
     bot.infinity_polling()
 
 if __name__ == '__main__':
+
     main()
